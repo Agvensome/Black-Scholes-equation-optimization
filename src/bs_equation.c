@@ -292,7 +292,7 @@ int check_divergence(double *u, int local_size, MPI_Comm comm) {
     return global_diverged;
 }
 
-// 计算期权价格
+// 计算期权价格 (原始版本，用于稳定性测试和常规运行)
 int compute_option_price(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
@@ -384,7 +384,107 @@ int compute_option_price(OptionParams *params, int use_implicit, MPI_Comm comm) 
     return diverged ? 1 : 0;
 }
 
-// 数值稳定性测试函数
+// 计算期权价格 (扩展版本，用于代码验证，返回最终解)
+int compute_option_price_verification(OptionParams *params, int use_implicit, MPI_Comm comm,
+                                     double **u_final, int *local_size_final, int *offset_final) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    
+    // 计算每个进程的局部网格大小
+    int local_size = params->N / size;
+    int remainder = params->N % size;
+    
+    // 处理不能整除的情况
+    if (rank < remainder) {
+        local_size++;
+    }
+    
+    int offset = rank * (params->N / size);
+    if (rank < remainder) {
+        offset += rank;
+    } else {
+        offset += remainder;
+    }
+    
+    double dS = params->S_max / (params->N - 1);
+    double dt = params->T / params->time_steps;
+    
+    // 初始化求解器状态
+    SolverState state;
+    state.current_step = 0;
+    params->current_time = 0.0; // 初始化当前时间
+    
+    // 检查是否需要重启
+    int restart_loaded = 0;
+    if (strlen(params->restart_file)) {
+        restart_loaded = load_restart_file(&state, &local_size, &offset, params, rank);
+    }
+    
+    if (!restart_loaded) {
+        // 分配内存
+        state.u = (double *)malloc(local_size * sizeof(double));
+        state.u_old = (double *)malloc(local_size * sizeof(double));
+        
+        // 设置初始条件
+        set_initial_condition(state.u, local_size, offset, params);
+        memcpy(state.u_old, state.u, local_size * sizeof(double));
+        
+        // 应用初始边界条件
+        apply_boundary_condition(state.u, local_size, rank, size, 0.0, params);
+    }
+    
+    // 时间步进循环
+    int diverged = 0;
+    for (int step = 0; step < params->time_steps; step++) {
+        if (diverged) break;
+        
+        if (use_implicit) {
+            implicit_euler_step(state.u, state.u_old, local_size, dS, dt, params, rank, size, comm);
+        } else {
+            explicit_euler_step(state.u, state.u_old, local_size, dS, dt, params, rank, size, comm);
+        }
+        
+        // 检查是否发散
+        if (step % 10 == 0) {
+            diverged = check_divergence(state.u, local_size, comm);
+            if (diverged) {
+                if (rank == 0) {
+                    printf("计算在时间步 %d (时间 %.4f) 发散\n", state.current_step, params->current_time);
+                }
+                break;
+            }
+        }
+        
+        state.current_step++;
+        params->current_time += dt;
+        
+        // 定期保存重启文件
+        if (params->save_interval > 0 && state.current_step % params->save_interval == 0) {
+            save_restart_file(&state, local_size, offset, params, rank);
+        }
+    }
+    
+    // 保存最终结果
+    if (params->save_interval > 0 && strlen(params->restart_file) && !diverged) {
+        save_restart_file(&state, local_size, offset, params, rank);
+    }
+    
+    // 处理最终结果
+    if (!diverged) {
+        *u_final = state.u;
+        *local_size_final = local_size;
+        *offset_final = offset;
+        free(state.u_old);  // 只释放u_old，保留u_final
+    } else {
+        // 释放内存
+        free(state.u);
+        free(state.u_old);
+    }
+    
+    return diverged ? 1 : 0;
+}
+
 // 数值稳定性测试函数
 void numerical_stability_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank;
@@ -441,6 +541,7 @@ void numerical_stability_test(OptionParams *params, int use_implicit, MPI_Comm c
         params->time_steps = (int)ceil(params->T / dt);
         if (params->time_steps < 1) params->time_steps = 1;
         
+        // 使用原始函数进行稳定性测试
         int result = compute_option_price(params, use_implicit, comm);
         int diverged;
         MPI_Reduce(&result, &diverged, 1, MPI_INT, MPI_MAX, 0, comm);
@@ -474,6 +575,333 @@ void numerical_stability_test(OptionParams *params, int use_implicit, MPI_Comm c
     }
 }
 
+// ======================== 代码验证部分 ========================
+
+// 标准正态分布的累积分布函数 (CDF)
+double norm_cdf(double x) {
+    return 0.5 * (1 + erf(x / sqrt(2.0)));
+}
+
+// 计算Black-Scholes解析解
+double black_scholes_exact(double S, double t, OptionParams *params) {
+    double T = params->T;
+    double tau = T - t;
+    if (tau <= 0) {  // 到期时刻
+        if (params->option_type == 0) { // 看涨期权
+            return fmax(S - params->K, 0.0);
+        } else { // 看跌期权
+            return fmax(params->K - S, 0.0);
+        }
+    }
+    
+    double d1 = (log(S / params->K) + (params->r + 0.5 * params->sigma * params->sigma) * tau) 
+                / (params->sigma * sqrt(tau));
+    double d2 = d1 - params->sigma * sqrt(tau);
+    
+    if (params->option_type == 0) { // 看涨期权
+        return S * norm_cdf(d1) - params->K * exp(-params->r * tau) * norm_cdf(d2);
+    } else { // 看跌期权
+        return params->K * exp(-params->r * tau) * norm_cdf(-d2) - S * norm_cdf(-d1);
+    }
+}
+
+// 计算最大模误差
+double calculate_max_error(double *u_num, int local_size, int offset, 
+                          OptionParams *params, double dS, MPI_Comm comm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+    
+    double local_max_error = 0.0;
+    for (int i = 0; i < local_size; i++) {
+        double S = (offset + i) * dS;
+        double u_exact = black_scholes_exact(S, 0.0, params); // t=0时刻
+        double error = fabs(u_exact - u_num[i]);
+        if (error > local_max_error) {
+            local_max_error = error;
+        }
+    }
+    
+    double global_max_error;
+    MPI_Reduce(&local_max_error, &global_max_error, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    return global_max_error;
+}
+
+// 空间收敛性测试 (带日志记录)
+void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+    
+    // 创建日志文件
+    FILE *log_file = NULL;
+    if (rank == 0) {
+        char log_filename[256];
+        snprintf(log_filename, sizeof(log_filename), "spatial_convergence_%s.log", 
+                use_implicit ? "implicit" : "explicit");
+        
+        log_file = fopen(log_filename, "w");
+        if (!log_file) {
+            perror("Failed to create spatial convergence log file");
+            return;
+        }
+        
+        // 写入日志头
+        fprintf(log_file, "===== 空间收敛性测试 =====\n");
+        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
+        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+                params->K, params->r, params->sigma, params->T, params->S_max);
+        fprintf(log_file, "固定时间步长: %d\n", 10000);
+        fprintf(log_file, "空间网格数 | 空间步长 dS | 最大模误差 | 收敛阶\n");
+        fprintf(log_file, "----------------------------------------------\n");
+    }
+    
+    // 固定时间步长，使用细网格确保时间误差可忽略
+    int fixed_time_steps = 10000;
+    int N_values[] = {50, 100, 200, 400, 800};
+    int num_tests = sizeof(N_values) / sizeof(N_values[0]);
+    
+    double *errors = (double *)malloc(num_tests * sizeof(double));
+    double *dS_values = (double *)malloc(num_tests * sizeof(double));
+    
+    // 保存原始参数
+    int original_N = params->N;
+    int original_time_steps = params->time_steps;
+    char original_restart_file[256];
+    strcpy(original_restart_file, params->restart_file);
+    params->restart_file[0] = '\0';
+    params->time_steps = fixed_time_steps;
+    
+    for (int i = 0; i < num_tests; i++) {
+        params->N = N_values[i];
+        
+        double *u_final = NULL;
+        int local_size, offset;
+        int result = compute_option_price_verification(params, use_implicit, comm, 
+                                                     &u_final, &local_size, &offset);
+        
+        if (result == 0) {
+            double dS = params->S_max / (params->N - 1);
+            double error = calculate_max_error(u_final, local_size, offset, params, dS, comm);
+            
+            if (rank == 0) {
+                errors[i] = error;
+                dS_values[i] = dS;
+                
+                // 写入日志
+                fprintf(log_file, "%9d | %11.6f | %10.6f |\n", params->N, dS, error);
+                
+                // 控制台输出
+                printf("空间网格数: %d, 误差: %.6f\n", params->N, error);
+            }
+            
+            free(u_final);
+        } else {
+            if (rank == 0) {
+                fprintf(log_file, "计算在 N=%d 时发散\n", params->N);
+                printf("计算在 N=%d 时发散\n", params->N);
+            }
+            break;
+        }
+    }
+    
+    // 计算并报告收敛阶
+    if (rank == 0) {
+        fprintf(log_file, "\n收敛阶分析:\n");
+        printf("\n收敛阶分析:\n");
+        
+        for (int i = 1; i < num_tests; i++) {
+            if (errors[i] > 0 && errors[i-1] > 0) {
+                double ratio = errors[i-1] / errors[i];
+                double dS_ratio = dS_values[i-1] / dS_values[i];
+                double convergence_order = log(ratio) / log(dS_ratio);
+                
+                char line[256];
+                snprintf(line, sizeof(line), 
+                         "从 N=%d 到 N=%d: 收敛阶 = %.4f (dS: %.4f -> %.4f, 误差: %.4f -> %.4f)",
+                         N_values[i-1], N_values[i], convergence_order,
+                         dS_values[i-1], dS_values[i],
+                         errors[i-1], errors[i]);
+                
+                fprintf(log_file, "%s\n", line);
+                printf("%s\n", line);
+            }
+        }
+        
+        fprintf(log_file, "----------------------------------------------\n");
+        fprintf(log_file, "测试完成\n");
+        
+        // 添加总结信息
+        fprintf(log_file, "\n===== 测试总结 =====\n");
+        fprintf(log_file, "空间离散方法: 有限差分法\n");
+        fprintf(log_file, "理论预期收敛阶: 2\n");
+        fprintf(log_file, "实际平均收敛阶: %.4f\n", 
+                (errors[1] > 0 && errors[0] > 0) ? 
+                log(errors[0]/errors[1]) / log(dS_values[0]/dS_values[1]) : 0);
+        fprintf(log_file, "验证结果: %s\n", 
+                (errors[num_tests-1] < 0.01) ? "通过" : "失败");
+        
+        fclose(log_file);
+        printf("空间收敛性测试结果已保存至: %s\n", "spatial_convergence_*.log");
+    }
+    
+    // 恢复原始参数
+    params->N = original_N;
+    params->time_steps = original_time_steps;
+    strcpy(params->restart_file, original_restart_file);
+    
+    free(errors);
+    free(dS_values);
+}
+
+// 时间收敛性测试 (带日志记录)
+void temporal_convergence_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+    
+    // 创建日志文件
+    FILE *log_file = NULL;
+    if (rank == 0) {
+        char log_filename[256];
+        snprintf(log_filename, sizeof(log_filename), "temporal_convergence_%s.log", 
+                use_implicit ? "implicit" : "explicit");
+        
+        log_file = fopen(log_filename, "w");
+        if (!log_file) {
+            perror("Failed to create temporal convergence log file");
+            return;
+        }
+        
+        // 写入日志头
+        fprintf(log_file, "===== 时间收敛性测试 =====\n");
+        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
+        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+                params->K, params->r, params->sigma, params->T, params->S_max);
+        fprintf(log_file, "固定空间网格数: %d\n", 1000);
+        fprintf(log_file, "时间步数 | 时间步长 dt | 最大模误差 | 收敛阶\n");
+        fprintf(log_file, "----------------------------------------------\n");
+    }
+    
+    // 固定空间网格数
+    int fixed_N = 1000;
+    int time_steps_values[] = {100, 200, 400, 800, 1600};
+    int num_tests = sizeof(time_steps_values) / sizeof(time_steps_values[0]);
+    
+    double *errors = (double *)malloc(num_tests * sizeof(double));
+    double *dt_values = (double *)malloc(num_tests * sizeof(double));
+    
+    // 保存原始参数
+    int original_N = params->N;
+    int original_time_steps = params->time_steps;
+    char original_restart_file[256];
+    strcpy(original_restart_file, params->restart_file);
+    params->restart_file[0] = '\0';
+    params->N = fixed_N;
+    
+    for (int i = 0; i < num_tests; i++) {
+        params->time_steps = time_steps_values[i];
+        
+        double *u_final = NULL;
+        int local_size, offset;
+        int result = compute_option_price_verification(params, use_implicit, comm, 
+                                                     &u_final, &local_size, &offset);
+        
+        if (result == 0) {
+            double dS = params->S_max / (params->N - 1);
+            double error = calculate_max_error(u_final, local_size, offset, params, dS, comm);
+            
+            if (rank == 0) {
+                errors[i] = error;
+                dt_values[i] = params->T / params->time_steps;
+                
+                // 写入日志
+                fprintf(log_file, "%8d | %11.6f | %10.6f |\n", 
+                       params->time_steps, dt_values[i], error);
+                
+                // 控制台输出
+                printf("时间步数: %d, 误差: %.6f\n", params->time_steps, error);
+            }
+            
+            free(u_final);
+        } else {
+            if (rank == 0) {
+                fprintf(log_file, "计算在时间步数=%d 时发散\n", params->time_steps);
+                printf("计算在时间步数=%d 时发散\n", params->time_steps);
+            }
+            break;
+        }
+    }
+    
+    // 计算并报告收敛阶
+    if (rank == 0) {
+        fprintf(log_file, "\n收敛阶分析:\n");
+        printf("\n收敛阶分析:\n");
+        
+        for (int i = 1; i < num_tests; i++) {
+            if (errors[i] > 0 && errors[i-1] > 0) {
+                double ratio = errors[i-1] / errors[i];
+                double dt_ratio = dt_values[i-1] / dt_values[i];
+                double convergence_order = log(ratio) / log(dt_ratio);
+                
+                char line[256];
+                snprintf(line, sizeof(line), 
+                         "从 时间步数=%d 到 %d: 收敛阶 = %.4f (dt: %.6f -> %.6f, 误差: %.6f -> %.6f)",
+                         time_steps_values[i-1], time_steps_values[i], convergence_order,
+                         dt_values[i-1], dt_values[i],
+                         errors[i-1], errors[i]);
+                
+                fprintf(log_file, "%s\n", line);
+                printf("%s\n", line);
+            }
+        }
+        
+        fprintf(log_file, "----------------------------------------------\n");
+        fprintf(log_file, "测试完成\n");
+        
+        // 添加总结信息
+        fprintf(log_file, "\n===== 测试总结 =====\n");
+        fprintf(log_file, "时间离散方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
+        fprintf(log_file, "理论预期收敛阶: %d\n", use_implicit ? 1 : 1);
+        fprintf(log_file, "实际平均收敛阶: %.4f\n", 
+                (errors[1] > 0 && errors[0] > 0) ? 
+                log(errors[0]/errors[1]) / log(dt_values[0]/dt_values[1]) : 0);
+        fprintf(log_file, "验证结果: %s\n", 
+                (errors[num_tests-1] < 0.01) ? "通过" : "失败");
+        
+        fclose(log_file);
+        printf("时间收敛性测试结果已保存至: %s\n", "temporal_convergence_*.log");
+    }
+    
+    // 恢复原始参数
+    params->N = original_N;
+    params->time_steps = original_time_steps;
+    strcpy(params->restart_file, original_restart_file);
+    
+    free(errors);
+    free(dt_values);
+}
+
+// 代码验证函数
+void code_verification(OptionParams *params, int use_implicit, MPI_Comm comm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+    
+    if (rank == 0) {
+        printf("\n===== 代码验证 =====\n");
+        printf("方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
+        printf("参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+              params->K, params->r, params->sigma, params->T, params->S_max);
+    }
+    
+    // 进行空间收敛性测试
+    spatial_convergence_test(params, use_implicit, comm);
+    
+    // 进行时间收敛性测试
+    temporal_convergence_test(params, use_implicit, comm);
+    
+    if (rank == 0) {
+        printf("代码验证完成\n");
+    }
+}
+
 // 主函数
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
@@ -500,6 +928,7 @@ int main(int argc, char **argv) {
     int use_implicit = 1; // 默认使用隐式方法
     int stability_test = 0; // 是否进行稳定性测试
     int test_mode = 0;    // 测试模式
+    int verification_mode = 0; // 代码验证模式
     
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
@@ -531,12 +960,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-stability_test") == 0) {
             stability_test = 1;
             params.stability_test = 1;
+        } else if (strcmp(argv[i], "-verification") == 0) {
+            verification_mode = 1;
         }
     }
     
     if (stability_test) {
         // 进行数值稳定性测试
         numerical_stability_test(&params, use_implicit, MPI_COMM_WORLD);
+    } else if (verification_mode) {
+        // 进行代码验证
+        code_verification(&params, use_implicit, MPI_COMM_WORLD);
     } else if (test_mode) {
         // 其他测试模式...
     } else {
