@@ -29,6 +29,18 @@ typedef struct {
     int current_step;    // 当前步数
 } SolverState;
 
+// 后处理结果结构体
+typedef struct {
+    double S;         // 资产价格
+    double price;     // 期权价格
+    double delta;     // Delta值 (?V/?S)
+} PostResult;
+
+// 函数声明
+int compute_option_price(OptionParams *params, int use_implicit, MPI_Comm comm);
+int compute_option_price_verification(OptionParams *params, int use_implicit, MPI_Comm comm,
+                                     double **u_final, int *local_size_final, int *offset_final);
+
 // 计算左边界值
 double left_boundary_value(double t, OptionParams *params) {
     if (params->option_type == 1) { // 看跌期权
@@ -292,7 +304,7 @@ int check_divergence(double *u, int local_size, MPI_Comm comm) {
     return global_diverged;
 }
 
-// 计算期权价格 (原始版本，用于稳定性测试和常规运行)
+// 计算期权价格
 int compute_option_price(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
@@ -384,7 +396,7 @@ int compute_option_price(OptionParams *params, int use_implicit, MPI_Comm comm) 
     return diverged ? 1 : 0;
 }
 
-// 计算期权价格 (扩展版本，用于代码验证，返回最终解)
+// 计算期权价格 (用于验证)
 int compute_option_price_verification(OptionParams *params, int use_implicit, MPI_Comm comm,
                                      double **u_final, int *local_size_final, int *offset_final) {
     int rank, size;
@@ -485,6 +497,220 @@ int compute_option_price_verification(OptionParams *params, int use_implicit, MP
     return diverged ? 1 : 0;
 }
 
+// ======================== 后处理功能 ========================
+
+// 保存后处理结果到文件
+void save_post_results(PostResult *results, int count, const char *filename) {
+    FILE *fp = fopen(filename, "w");
+    if (fp) {
+        fprintf(fp, "# Asset Price (S) | Option Price | Delta (dV/dS)\n");
+        for (int i = 0; i < count; i++) {
+            fprintf(fp, "%.6f %.6f %.6f\n", 
+                   results[i].S, results[i].price, results[i].delta);
+        }
+        fclose(fp);
+        printf("Saved post-processing results to: %s\n", filename);
+    } else {
+        perror("Failed to save post-processing results");
+    }
+}
+
+// 计算Delta值 (?V/?S)
+void compute_delta(double *u, int n, double dS, double *delta) {
+    // 左边界：前向差分
+    delta[0] = (u[1] - u[0]) / dS;
+    
+    // 内部点：中心差分
+    for (int i = 1; i < n - 1; i++) {
+        delta[i] = (u[i+1] - u[i-1]) / (2 * dS);
+    }
+    
+    // 右边界：后向差分
+    delta[n-1] = (u[n-1] - u[n-2]) / dS;
+}
+
+// 运行后处理任务
+void run_postprocessing(OptionParams *params, int use_implicit, MPI_Comm comm) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    
+    if (rank == 0) {
+        printf("\n===== Running Postprocessing =====\n");
+        printf("Option type: %s\n", params->option_type ? "Put" : "Call");
+        printf("Strike price (K): %.2f\n", params->K);
+        printf("Risk-free rate (r): %.4f\n", params->r);
+        printf("Volatility (sigma): %.4f\n", params->sigma);
+        printf("Maturity (T): %.2f\n", params->T);
+        printf("Asset max (S_max): %.2f\n", params->S_max);
+        printf("Space points (N): %d\n", params->N);
+        printf("Time steps: %d\n", params->time_steps);
+        printf("Method: %s\n", use_implicit ? "Implicit Euler" : "Explicit Euler");
+    }
+    
+    // 计算空间步长
+    double dS = params->S_max / (params->N - 1);
+    
+    // 计算时间步长
+    double dt = params->T / params->time_steps;
+    
+    // 输出时间点
+    double output_times[] = {
+        0.0,               // t = 0
+        0.25 * params->T,  // t = 0.25T
+        0.50 * params->T,  // t = 0.50T
+        0.75 * params->T,  // t = 0.75T
+        params->T          // t = T
+    };
+    int num_output_times = sizeof(output_times) / sizeof(output_times[0]);
+    
+    // 每个进程的局部网格大小
+    int local_size = params->N / size;
+    int remainder = params->N % size;
+    if (rank < remainder) local_size++;
+    
+    // 偏移量
+    int offset = rank * (params->N / size);
+    if (rank < remainder) {
+        offset += rank;
+    } else {
+        offset += remainder;
+    }
+    
+    // 初始化求解器状态
+    SolverState state;
+    state.current_step = 0;
+    params->current_time = 0.0;
+    
+    // 分配内存
+    state.u = (double *)malloc(local_size * sizeof(double));
+    state.u_old = (double *)malloc(local_size * sizeof(double));
+    
+    // 设置初始条件
+    set_initial_condition(state.u, local_size, offset, params);
+    memcpy(state.u_old, state.u, local_size * sizeof(double));
+    
+    // 应用初始边界条件
+    apply_boundary_condition(state.u, local_size, rank, size, 0.0, params);
+    
+    // 收集全局解到主进程
+    double *global_u = NULL;
+    if (rank == 0) {
+        global_u = (double *)malloc(params->N * sizeof(double));
+    }
+    
+    // 收集每个进程的局部大小
+    int *recvcounts = NULL;
+    int *displs = NULL;
+    if (rank == 0) {
+        recvcounts = (int *)malloc(size * sizeof(int));
+        displs = (int *)malloc(size * sizeof(int));
+    }
+    
+    // 收集局部大小
+    MPI_Gather(&local_size, 1, MPI_INT, recvcounts, 1, MPI_INT, 0, comm);
+    
+    // 计算位移
+    if (rank == 0) {
+        displs[0] = 0;
+        for (int i = 1; i < size; i++) {
+            displs[i] = displs[i-1] + recvcounts[i-1];
+        }
+    }
+    
+    // 主进程存储结果
+    PostResult *results = NULL;
+    if (rank == 0) {
+        results = (PostResult *)malloc(params->N * sizeof(PostResult));
+    }
+    
+    // 时间步进循环
+    for (int step = 0; step < params->time_steps; step++) {
+        // 选择时间步进方法
+        if (use_implicit) {
+            implicit_euler_step(state.u, state.u_old, local_size, dS, dt, 
+                               params, rank, size, comm);
+        } else {
+            explicit_euler_step(state.u, state.u_old, local_size, dS, dt, 
+                               params, rank, size, comm);
+        }
+        
+        state.current_step++;
+        params->current_time += dt;
+        
+        // 检查是否需要输出
+        for (int i = 0; i < num_output_times; i++) {
+            double time_diff = fabs(params->current_time - output_times[i]);
+            if (time_diff < 0.5 * dt) {
+                // 收集全局解
+                MPI_Gatherv(state.u, local_size, MPI_DOUBLE,
+                           global_u, recvcounts, displs, MPI_DOUBLE,
+                           0, comm);
+                
+                if (rank == 0) {
+                    // 计算Delta值
+                    double *delta = (double *)malloc(params->N * sizeof(double));
+                    compute_delta(global_u, params->N, dS, delta);
+                    
+                    // 准备结果
+                    for (int j = 0; j < params->N; j++) {
+                        results[j].S = j * dS;
+                        results[j].price = global_u[j];
+                        results[j].delta = delta[j];
+                    }
+                    
+                    // 保存结果为.dat文件
+                    char filename[256];
+                    const char *method_name = use_implicit ? "implicit" : "explicit";
+                    snprintf(filename, sizeof(filename), 
+                             "results_t%.2f_%s.dat", output_times[i], method_name);
+                    save_post_results(results, params->N, filename);
+                    
+                    free(delta);
+                }
+            }
+        }
+    }
+    
+    // 保存最终结果
+    MPI_Gatherv(state.u, local_size, MPI_DOUBLE,
+               global_u, recvcounts, displs, MPI_DOUBLE,
+               0, comm);
+    
+    if (rank == 0) {
+        // 计算Delta值
+        double *delta = (double *)malloc(params->N * sizeof(double));
+        compute_delta(global_u, params->N, dS, delta);
+        
+        // 准备结果
+        for (int j = 0; j < params->N; j++) {
+            results[j].S = j * dS;
+            results[j].price = global_u[j];
+            results[j].delta = delta[j];
+        }
+        
+        // 保存结果为.dat文件
+        char filename[256];
+        const char *method_name = use_implicit ? "implicit" : "explicit";
+        snprintf(filename, sizeof(filename), "results_final_%s.dat", method_name);
+        save_post_results(results, params->N, filename);
+        
+        free(delta);
+    }
+    
+    // 清理资源
+    free(state.u);
+    free(state.u_old);
+    if (rank == 0) {
+        free(global_u);
+        free(recvcounts);
+        free(displs);
+        free(results);
+    }
+}
+
+// ======================== 数值稳定性测试 ========================
+
 // 数值稳定性测试函数
 void numerical_stability_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank;
@@ -575,7 +801,7 @@ void numerical_stability_test(OptionParams *params, int use_implicit, MPI_Comm c
     }
 }
 
-// ======================== 代码验证部分 ========================
+// ======================== 代码验证功能 ========================
 
 // 标准正态分布的累积分布函数 (CDF)
 double norm_cdf(double x) {
@@ -626,32 +852,32 @@ double calculate_max_error(double *u_num, int local_size, int offset,
     return global_max_error;
 }
 
-// 空间收敛性测试 (带日志记录)
+// 空间收敛性测试 (输出为.dat文件)
 void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank;
     MPI_Comm_rank(comm, &rank);
     
-    // 创建日志文件
-    FILE *log_file = NULL;
+    // 创建输出文件
+    FILE *out_file = NULL;
     if (rank == 0) {
-        char log_filename[256];
-        snprintf(log_filename, sizeof(log_filename), "spatial_convergence_%s.log", 
+        char out_filename[256];
+        snprintf(out_filename, sizeof(out_filename), "spatial_convergence_%s.dat", 
                 use_implicit ? "implicit" : "explicit");
         
-        log_file = fopen(log_filename, "w");
-        if (!log_file) {
-            perror("Failed to create spatial convergence log file");
+        out_file = fopen(out_filename, "w");
+        if (!out_file) {
+            perror("Failed to create spatial convergence output file");
             return;
         }
         
-        // 写入日志头
-        fprintf(log_file, "===== 空间收敛性测试 =====\n");
-        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
-        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+        // 写入文件头
+        fprintf(out_file, "# Spatial Convergence Test Results\n");
+        fprintf(out_file, "# Method: %s\n", use_implicit ? "Implicit Euler" : "Explicit Euler");
+        fprintf(out_file, "# Parameters: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
                 params->K, params->r, params->sigma, params->T, params->S_max);
-        fprintf(log_file, "固定时间步长: %d\n", 10000);
-        fprintf(log_file, "空间网格数 | 空间步长 dS | 最大模误差 | 收敛阶\n");
-        fprintf(log_file, "----------------------------------------------\n");
+        fprintf(out_file, "# Fixed time steps: %d\n", 10000);
+        fprintf(out_file, "# Columns: SpacePoints SpaceStep(dS) MaxError\n");
+        fprintf(out_file, "# ----------------------------------------------\n");
     }
     
     // 固定时间步长，使用细网格确保时间误差可忽略
@@ -686,8 +912,8 @@ void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm c
                 errors[i] = error;
                 dS_values[i] = dS;
                 
-                // 写入日志
-                fprintf(log_file, "%9d | %11.6f | %10.6f |\n", params->N, dS, error);
+                // 写入输出文件
+                fprintf(out_file, "%d %.6f %.6f\n", params->N, dS, error);
                 
                 // 控制台输出
                 printf("空间网格数: %d, 误差: %.6f\n", params->N, error);
@@ -696,7 +922,7 @@ void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm c
             free(u_final);
         } else {
             if (rank == 0) {
-                fprintf(log_file, "计算在 N=%d 时发散\n", params->N);
+                fprintf(out_file, "# Calculation diverged at N=%d\n", params->N);
                 printf("计算在 N=%d 时发散\n", params->N);
             }
             break;
@@ -705,7 +931,7 @@ void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm c
     
     // 计算并报告收敛阶
     if (rank == 0) {
-        fprintf(log_file, "\n收敛阶分析:\n");
+        fprintf(out_file, "\n# Convergence Order Analysis\n");
         printf("\n收敛阶分析:\n");
         
         for (int i = 1; i < num_tests; i++) {
@@ -716,31 +942,31 @@ void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm c
                 
                 char line[256];
                 snprintf(line, sizeof(line), 
-                         "从 N=%d 到 N=%d: 收敛阶 = %.4f (dS: %.4f -> %.4f, 误差: %.4f -> %.4f)",
+                         "# From N=%d to N=%d: Convergence order = %.4f (dS: %.4f -> %.4f, Error: %.4f -> %.4f)",
                          N_values[i-1], N_values[i], convergence_order,
                          dS_values[i-1], dS_values[i],
                          errors[i-1], errors[i]);
                 
-                fprintf(log_file, "%s\n", line);
+                fprintf(out_file, "%s\n", line);
                 printf("%s\n", line);
             }
         }
         
-        fprintf(log_file, "----------------------------------------------\n");
-        fprintf(log_file, "测试完成\n");
+        fprintf(out_file, "# ----------------------------------------------\n");
+        fprintf(out_file, "# Test completed\n");
         
         // 添加总结信息
-        fprintf(log_file, "\n===== 测试总结 =====\n");
-        fprintf(log_file, "空间离散方法: 有限差分法\n");
-        fprintf(log_file, "理论预期收敛阶: 2\n");
-        fprintf(log_file, "实际平均收敛阶: %.4f\n", 
+        fprintf(out_file, "\n# Test Summary\n");
+        fprintf(out_file, "# Spatial discretization method: Finite Difference\n");
+        fprintf(out_file, "# Theoretical expected convergence order: 2\n");
+        fprintf(out_file, "# Actual average convergence order: %.4f\n", 
                 (errors[1] > 0 && errors[0] > 0) ? 
                 log(errors[0]/errors[1]) / log(dS_values[0]/dS_values[1]) : 0);
-        fprintf(log_file, "验证结果: %s\n", 
-                (errors[num_tests-1] < 0.01) ? "通过" : "失败");
+        fprintf(out_file, "# Verification result: %s\n", 
+                (errors[num_tests-1] < 0.01) ? "PASS" : "FAIL");
         
-        fclose(log_file);
-        printf("空间收敛性测试结果已保存至: %s\n", "spatial_convergence_*.log");
+        fclose(out_file);
+        printf("空间收敛性测试结果已保存至: %s\n", "spatial_convergence_*.dat");
     }
     
     // 恢复原始参数
@@ -752,32 +978,32 @@ void spatial_convergence_test(OptionParams *params, int use_implicit, MPI_Comm c
     free(dS_values);
 }
 
-// 时间收敛性测试 (带日志记录)
+// 时间收敛性测试 (输出为.dat文件)
 void temporal_convergence_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank;
     MPI_Comm_rank(comm, &rank);
     
-    // 创建日志文件
-    FILE *log_file = NULL;
+    // 创建输出文件
+    FILE *out_file = NULL;
     if (rank == 0) {
-        char log_filename[256];
-        snprintf(log_filename, sizeof(log_filename), "temporal_convergence_%s.log", 
+        char out_filename[256];
+        snprintf(out_filename, sizeof(out_filename), "temporal_convergence_%s.dat", 
                 use_implicit ? "implicit" : "explicit");
         
-        log_file = fopen(log_filename, "w");
-        if (!log_file) {
-            perror("Failed to create temporal convergence log file");
+        out_file = fopen(out_filename, "w");
+        if (!out_file) {
+            perror("Failed to create temporal convergence output file");
             return;
         }
         
-        // 写入日志头
-        fprintf(log_file, "===== 时间收敛性测试 =====\n");
-        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
-        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+        // 写入文件头
+        fprintf(out_file, "# Temporal Convergence Test Results\n");
+        fprintf(out_file, "# Method: %s\n", use_implicit ? "Implicit Euler" : "Explicit Euler");
+        fprintf(out_file, "# Parameters: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
                 params->K, params->r, params->sigma, params->T, params->S_max);
-        fprintf(log_file, "固定空间网格数: %d\n", 1000);
-        fprintf(log_file, "时间步数 | 时间步长 dt | 最大模误差 | 收敛阶\n");
-        fprintf(log_file, "----------------------------------------------\n");
+        fprintf(out_file, "# Fixed space points: %d\n", 1000);
+        fprintf(out_file, "# Columns: TimeSteps TimeStep(dt) MaxError\n");
+        fprintf(out_file, "# ----------------------------------------------\n");
     }
     
     // 固定空间网格数
@@ -812,8 +1038,8 @@ void temporal_convergence_test(OptionParams *params, int use_implicit, MPI_Comm 
                 errors[i] = error;
                 dt_values[i] = params->T / params->time_steps;
                 
-                // 写入日志
-                fprintf(log_file, "%8d | %11.6f | %10.6f |\n", 
+                // 写入输出文件
+                fprintf(out_file, "%d %.6f %.6f\n", 
                        params->time_steps, dt_values[i], error);
                 
                 // 控制台输出
@@ -823,7 +1049,7 @@ void temporal_convergence_test(OptionParams *params, int use_implicit, MPI_Comm 
             free(u_final);
         } else {
             if (rank == 0) {
-                fprintf(log_file, "计算在时间步数=%d 时发散\n", params->time_steps);
+                fprintf(out_file, "# Calculation diverged at time steps=%d\n", params->time_steps);
                 printf("计算在时间步数=%d 时发散\n", params->time_steps);
             }
             break;
@@ -832,7 +1058,7 @@ void temporal_convergence_test(OptionParams *params, int use_implicit, MPI_Comm 
     
     // 计算并报告收敛阶
     if (rank == 0) {
-        fprintf(log_file, "\n收敛阶分析:\n");
+        fprintf(out_file, "\n# Convergence Order Analysis\n");
         printf("\n收敛阶分析:\n");
         
         for (int i = 1; i < num_tests; i++) {
@@ -843,31 +1069,31 @@ void temporal_convergence_test(OptionParams *params, int use_implicit, MPI_Comm 
                 
                 char line[256];
                 snprintf(line, sizeof(line), 
-                         "从 时间步数=%d 到 %d: 收敛阶 = %.4f (dt: %.6f -> %.6f, 误差: %.6f -> %.6f)",
+                         "# From time steps=%d to %d: Convergence order = %.4f (dt: %.6f -> %.6f, Error: %.6f -> %.6f)",
                          time_steps_values[i-1], time_steps_values[i], convergence_order,
                          dt_values[i-1], dt_values[i],
                          errors[i-1], errors[i]);
                 
-                fprintf(log_file, "%s\n", line);
+                fprintf(out_file, "%s\n", line);
                 printf("%s\n", line);
             }
         }
         
-        fprintf(log_file, "----------------------------------------------\n");
-        fprintf(log_file, "测试完成\n");
+        fprintf(out_file, "# ----------------------------------------------\n");
+        fprintf(out_file, "# Test completed\n");
         
         // 添加总结信息
-        fprintf(log_file, "\n===== 测试总结 =====\n");
-        fprintf(log_file, "时间离散方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
-        fprintf(log_file, "理论预期收敛阶: %d\n", use_implicit ? 1 : 1);
-        fprintf(log_file, "实际平均收敛阶: %.4f\n", 
+        fprintf(out_file, "\n# Test Summary\n");
+        fprintf(out_file, "# Time discretization method: %s\n", use_implicit ? "Implicit Euler" : "Explicit Euler");
+        fprintf(out_file, "# Theoretical expected convergence order: %d\n", use_implicit ? 1 : 1);
+        fprintf(out_file, "# Actual average convergence order: %.4f\n", 
                 (errors[1] > 0 && errors[0] > 0) ? 
                 log(errors[0]/errors[1]) / log(dt_values[0]/dt_values[1]) : 0);
-        fprintf(log_file, "验证结果: %s\n", 
-                (errors[num_tests-1] < 0.01) ? "通过" : "失败");
+        fprintf(out_file, "# Verification result: %s\n", 
+                (errors[num_tests-1] < 0.01) ? "PASS" : "FAIL");
         
-        fclose(log_file);
-        printf("时间收敛性测试结果已保存至: %s\n", "temporal_convergence_*.log");
+        fclose(out_file);
+        printf("时间收敛性测试结果已保存至: %s\n", "temporal_convergence_*.dat");
     }
     
     // 恢复原始参数
@@ -902,6 +1128,8 @@ void code_verification(OptionParams *params, int use_implicit, MPI_Comm comm) {
     }
 }
 
+// ======================== 并行性能测试 ========================
+
 // 固定问题规模并行性能测试
 void fixed_size_scalability_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
     int rank, size;
@@ -916,30 +1144,30 @@ void fixed_size_scalability_test(OptionParams *params, int use_implicit, MPI_Com
     const int proc_list[] = {1, 2, 4, 8, 16};
     const int num_tests = sizeof(proc_list)/sizeof(proc_list[0]);
     
-    // 创建日志文件
-    FILE *log_file = NULL;
-    char log_filename[256];
+    // 创建输出文件
+    FILE *out_file = NULL;
+    char out_filename[256];
     if (rank == 0) {
-        snprintf(log_filename, sizeof(log_filename), 
-                "fixed_size_scalability_%s.log",
+        snprintf(out_filename, sizeof(out_filename), 
+                "fixed_size_scalability_%s.dat",
                 use_implicit ? "implicit" : "explicit");
-        log_file = fopen(log_filename, "w");
-        if (!log_file) {
-            perror("Failed to create fixed size scalability log file");
+        out_file = fopen(out_filename, "w");
+        if (!out_file) {
+            perror("Failed to create fixed size scalability output file");
             return;
         }
         
-        // 写入日志头
-        fprintf(log_file, "===== 固定问题规模并行性能测试 =====\n");
-        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
-        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+        // 写入文件头
+        fprintf(out_file, "# Fixed Problem Size Parallel Performance Test\n");
+        fprintf(out_file, "# Method: %s\n", use_implicit ? "Implicit Euler" : "Explicit Euler");
+        fprintf(out_file, "# Parameters: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
                 params->K, params->r, params->sigma, params->T, params->S_max);
-        fprintf(log_file, "固定全局网格点数: %d\n", fixed_N);
-        fprintf(log_file, "固定时间步数: %d\n", fixed_time_steps);
-        fprintf(log_file, "测试重复次数: %d\n", repeats);
-        fprintf(log_file, "-------------------------------------------------------------\n");
-        fprintf(log_file, "进程数 | 全局网格点数 | 组装时间(s) | 求解时间(s) | 总时间(s) | 加速比 | 效率(%%)\n");
-        fprintf(log_file, "-------------------------------------------------------------\n");
+        fprintf(out_file, "# Fixed space points: %d\n", fixed_N);
+        fprintf(out_file, "# Fixed time steps: %d\n", fixed_time_steps);
+        fprintf(out_file, "# Test repeats: %d\n", repeats);
+        fprintf(out_file, "# --------------------------------------------------------------\n");
+        fprintf(out_file, "# Procs | SpacePoints | AssemblyTime(s) | SolverTime(s) | TotalTime(s) | Speedup | Efficiency(%%)\n");
+        fprintf(out_file, "# --------------------------------------------------------------\n");
     }
     
     // 保存原始参数
@@ -1026,8 +1254,8 @@ void fixed_size_scalability_test(OptionParams *params, int use_implicit, MPI_Com
                     base_total_time = total_time;
                 }
                 
-                // 写入日志
-                fprintf(log_file, "%6d | %11d | %10.4f | %10.4f | %10.4f | %7.2f | %8.2f\n",
+                // 写入输出文件
+                fprintf(out_file, "%d %d %.4f %.4f %.4f %.2f %.2f\n",
                        num_procs, fixed_N, assembly_time, solver_time, total_time,
                        speedup, efficiency);
                 
@@ -1045,10 +1273,10 @@ void fixed_size_scalability_test(OptionParams *params, int use_implicit, MPI_Com
     params->time_steps = original_time_steps;
     
     if (rank == 0) {
-        fprintf(log_file, "-------------------------------------------------------------\n");
-        fprintf(log_file, "测试完成\n");
-        fclose(log_file);
-        printf("固定问题规模测试结果已保存至: %s\n", log_filename);
+        fprintf(out_file, "# --------------------------------------------------------------\n");
+        fprintf(out_file, "# Test completed\n");
+        fclose(out_file);
+        printf("固定问题规模测试结果已保存至: %s\n", out_filename);
     }
 }
 
@@ -1066,30 +1294,30 @@ void isogranular_scalability_test(OptionParams *params, int use_implicit, MPI_Co
     const int proc_list[] = {1, 2, 4, 8, 16};
     const int num_tests = sizeof(proc_list)/sizeof(proc_list[0]);
     
-    // 创建日志文件
-    FILE *log_file = NULL;
-    char log_filename[256];
+    // 创建输出文件
+    FILE *out_file = NULL;
+    char out_filename[256];
     if (rank == 0) {
-        snprintf(log_filename, sizeof(log_filename), 
-                "isogranular_scalability_%s.log",
+        snprintf(out_filename, sizeof(out_filename), 
+                "isogranular_scalability_%s.dat",
                 use_implicit ? "implicit" : "explicit");
-        log_file = fopen(log_filename, "w");
-        if (!log_file) {
-            perror("Failed to create isogranular scalability log file");
+        out_file = fopen(out_filename, "w");
+        if (!out_file) {
+            perror("Failed to create isogranular scalability output file");
             return;
         }
         
-        // 写入日志头
-        fprintf(log_file, "===== 固定每进程问题规模并行性能测试 =====\n");
-        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
-        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+        // 写入文件头
+        fprintf(out_file, "# Fixed Per-Processor Problem Size Parallel Performance Test\n");
+        fprintf(out_file, "# Method: %s\n", use_implicit ? "Implicit Euler" : "Explicit Euler");
+        fprintf(out_file, "# Parameters: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
                 params->K, params->r, params->sigma, params->T, params->S_max);
-        fprintf(log_file, "每进程网格点数: %d\n", per_proc_N);
-        fprintf(log_file, "固定时间步数: %d\n", fixed_time_steps);
-        fprintf(log_file, "测试重复次数: %d\n", repeats);
-        fprintf(log_file, "--------------------------------------------------------------------------------\n");
-        fprintf(log_file, "进程数 | 全局网格点数 | 每进程网格点数 | 组装时间(s) | 求解时间(s) | 总时间(s) | 相对时间\n");
-        fprintf(log_file, "--------------------------------------------------------------------------------\n");
+        fprintf(out_file, "# Per-processor space points: %d\n", per_proc_N);
+        fprintf(out_file, "# Fixed time steps: %d\n", fixed_time_steps);
+        fprintf(out_file, "# Test repeats: %d\n", repeats);
+        fprintf(out_file, "# --------------------------------------------------------------------------------\n");
+        fprintf(out_file, "# Procs | GlobalSpace | PerProcSpace | AssemblyTime(s) | SolverTime(s) | TotalTime(s) | RelativeTime\n");
+        fprintf(out_file, "# --------------------------------------------------------------------------------\n");
     }
     
     // 保存原始参数
@@ -1173,8 +1401,8 @@ void isogranular_scalability_test(OptionParams *params, int use_implicit, MPI_Co
                     base_total_time = total_time;
                 }
                 
-                // 写入日志
-                fprintf(log_file, "%6d | %11d | %13d | %10.4f | %10.4f | %10.4f | %9.4f\n",
+                // 写入输出文件
+                fprintf(out_file, "%d %d %d %.4f %.4f %.4f %.4f\n",
                        num_procs, global_N, per_proc_N, 
                        assembly_time, solver_time, total_time, relative_time);
                 
@@ -1191,14 +1419,15 @@ void isogranular_scalability_test(OptionParams *params, int use_implicit, MPI_Co
     params->time_steps = original_time_steps;
     
     if (rank == 0) {
-        fprintf(log_file, "--------------------------------------------------------------------------------\n");
-        fprintf(log_file, "测试完成\n");
-        fclose(log_file);
-        printf("固定每进程问题规模测试结果已保存至: %s\n", log_filename);
+        fprintf(out_file, "# --------------------------------------------------------------------------------\n");
+        fprintf(out_file, "# Test completed\n");
+        fclose(out_file);
+        printf("固定每进程问题规模测试结果已保存至: %s\n", out_filename);
     }
 }
 
-// 主函数
+// ======================== 主函数 ========================
+
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     
@@ -1227,6 +1456,7 @@ int main(int argc, char **argv) {
     int verification_mode = 0; // 代码验证模式
     int fixed_size_test = 0;
     int isogranular_test = 0;
+    int post_mode = 0;    // 后处理模式
     
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
@@ -1264,9 +1494,12 @@ int main(int argc, char **argv) {
             fixed_size_test = 1;
         } else if (strcmp(argv[i], "-isogranular_test") == 0) {
             isogranular_test = 1;
+        } else if (strcmp(argv[i], "-post") == 0) {
+            post_mode = 1;
         }
     }
     
+    // 根据命令行参数选择功能
     if (stability_test) {
         // 进行数值稳定性测试
         numerical_stability_test(&params, use_implicit, MPI_COMM_WORLD);
@@ -1279,9 +1512,14 @@ int main(int argc, char **argv) {
     } else if (isogranular_test) {
         // 固定每进程问题规模并行性能测试
         isogranular_scalability_test(&params, use_implicit, MPI_COMM_WORLD);
+    } else if (post_mode) {
+        
+        // 运行后处理
+        run_postprocessing(&params, use_implicit, MPI_COMM_WORLD);
     } else if (test_mode) {
-        // 其他测试模式...
+        // TODO: 其他测试模式...
     } else {
+        // 普通计算模式
         if (rank == 0) {
             printf("Running Black-Scholes solver with parameters:\n");
             printf("  Option type:       %s\n", params.option_type ? "Put" : "Call");
