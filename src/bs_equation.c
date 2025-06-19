@@ -902,6 +902,302 @@ void code_verification(OptionParams *params, int use_implicit, MPI_Comm comm) {
     }
 }
 
+// 固定问题规模并行性能测试
+void fixed_size_scalability_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    
+    // 固定参数
+    const int fixed_N = 10000;         // 固定全局网格点数
+    const int fixed_time_steps = 100;   // 固定时间步数
+    const int repeats = 3;              // 重复测试次数
+    
+    // 进程数列表
+    const int proc_list[] = {1, 2, 4, 8, 16};
+    const int num_tests = sizeof(proc_list)/sizeof(proc_list[0]);
+    
+    // 创建日志文件
+    FILE *log_file = NULL;
+    char log_filename[256];
+    if (rank == 0) {
+        snprintf(log_filename, sizeof(log_filename), 
+                "fixed_size_scalability_%s.log",
+                use_implicit ? "implicit" : "explicit");
+        log_file = fopen(log_filename, "w");
+        if (!log_file) {
+            perror("Failed to create fixed size scalability log file");
+            return;
+        }
+        
+        // 写入日志头
+        fprintf(log_file, "===== 固定问题规模并行性能测试 =====\n");
+        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
+        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+                params->K, params->r, params->sigma, params->T, params->S_max);
+        fprintf(log_file, "固定全局网格点数: %d\n", fixed_N);
+        fprintf(log_file, "固定时间步数: %d\n", fixed_time_steps);
+        fprintf(log_file, "测试重复次数: %d\n", repeats);
+        fprintf(log_file, "-------------------------------------------------------------\n");
+        fprintf(log_file, "进程数 | 全局网格点数 | 组装时间(s) | 求解时间(s) | 总时间(s) | 加速比 | 效率(%%)\n");
+        fprintf(log_file, "-------------------------------------------------------------\n");
+    }
+    
+    // 保存原始参数
+    int original_N = params->N;
+    int original_time_steps = params->time_steps;
+    params->N = fixed_N;
+    params->time_steps = fixed_time_steps;
+    
+    // 单进程基准时间
+    double base_assembly_time = 0.0;
+    double base_solver_time = 0.0;
+    double base_total_time = 0.0;
+    
+    // 测试不同进程数
+    for (int i = 0; i < num_tests; i++) {
+        int num_procs = proc_list[i];
+        
+        // 创建子通信器
+        MPI_Comm sub_comm;
+        MPI_Comm_split(comm, rank < num_procs ? 0 : MPI_UNDEFINED, rank, &sub_comm);
+        
+        if (rank < num_procs) {
+            double total_assembly = 0.0;
+            double total_solver = 0.0;
+            double total_total = 0.0;
+            
+            // 重复测试
+            for (int r = 0; r < repeats; r++) {
+                // 计时变量
+                double assembly_start, assembly_end;
+                double solver_start, solver_end;
+                double total_start, total_end;
+                
+                // 重置参数
+                params->current_time = 0.0;
+                
+                // 开始总计时
+                MPI_Barrier(sub_comm);
+                total_start = MPI_Wtime();
+                
+                // 模拟矩阵组装过程
+                MPI_Barrier(sub_comm);
+                assembly_start = MPI_Wtime();
+                // 实际矩阵组装代码将放在这里
+                assembly_end = MPI_Wtime();
+                
+                // 模拟求解过程
+                MPI_Barrier(sub_comm);
+                solver_start = MPI_Wtime();
+                // 实际求解器代码将放在这里
+                solver_end = MPI_Wtime();
+                
+                // 结束总计时
+                MPI_Barrier(sub_comm);
+                total_end = MPI_Wtime();
+                
+                // 累加时间
+                total_assembly += (assembly_end - assembly_start);
+                total_solver += (solver_end - solver_start);
+                total_total += (total_end - total_start);
+            }
+            
+            // 计算平均时间
+            double avg_assembly = total_assembly / repeats;
+            double avg_solver = total_solver / repeats;
+            double avg_total = total_total / repeats;
+            
+            // 收集到主进程
+            double assembly_time, solver_time, total_time;
+            MPI_Reduce(&avg_assembly, &assembly_time, 1, MPI_DOUBLE, MPI_SUM, 0, sub_comm);
+            MPI_Reduce(&avg_solver, &solver_time, 1, MPI_DOUBLE, MPI_SUM, 0, sub_comm);
+            MPI_Reduce(&avg_total, &total_time, 1, MPI_DOUBLE, MPI_SUM, 0, sub_comm);
+            
+            // 主进程记录结果
+            if (rank == 0) {
+                // 计算加速比和效率
+                double speedup = (i == 0) ? 1.0 : base_total_time / total_time;
+                double efficiency = (speedup / num_procs) * 100;
+                
+                // 保存基准时间
+                if (i == 0) {
+                    base_assembly_time = assembly_time;
+                    base_solver_time = solver_time;
+                    base_total_time = total_time;
+                }
+                
+                // 写入日志
+                fprintf(log_file, "%6d | %11d | %10.4f | %10.4f | %10.4f | %7.2f | %8.2f\n",
+                       num_procs, fixed_N, assembly_time, solver_time, total_time,
+                       speedup, efficiency);
+                
+                // 控制台输出
+                printf("进程数: %d, 总时间: %.4fs, 加速比: %.2f, 效率: %.2f%%\n",
+                       num_procs, total_time, speedup, efficiency);
+            }
+            
+            MPI_Comm_free(&sub_comm);
+        }
+    }
+    
+    // 恢复原始参数
+    params->N = original_N;
+    params->time_steps = original_time_steps;
+    
+    if (rank == 0) {
+        fprintf(log_file, "-------------------------------------------------------------\n");
+        fprintf(log_file, "测试完成\n");
+        fclose(log_file);
+        printf("固定问题规模测试结果已保存至: %s\n", log_filename);
+    }
+}
+
+// 固定每进程问题规模并行性能测试
+void isogranular_scalability_test(OptionParams *params, int use_implicit, MPI_Comm comm) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    
+    // 固定参数
+    const int per_proc_N = 1000;        // 每进程网格点数
+    const int fixed_time_steps = 100;    // 固定时间步数
+    const int repeats = 3;               // 重复测试次数
+    
+    // 进程数列表
+    const int proc_list[] = {1, 2, 4, 8, 16};
+    const int num_tests = sizeof(proc_list)/sizeof(proc_list[0]);
+    
+    // 创建日志文件
+    FILE *log_file = NULL;
+    char log_filename[256];
+    if (rank == 0) {
+        snprintf(log_filename, sizeof(log_filename), 
+                "isogranular_scalability_%s.log",
+                use_implicit ? "implicit" : "explicit");
+        log_file = fopen(log_filename, "w");
+        if (!log_file) {
+            perror("Failed to create isogranular scalability log file");
+            return;
+        }
+        
+        // 写入日志头
+        fprintf(log_file, "===== 固定每进程问题规模并行性能测试 =====\n");
+        fprintf(log_file, "方法: %s\n", use_implicit ? "隐式欧拉" : "显式欧拉");
+        fprintf(log_file, "参数: K=%.2f, r=%.4f, sigma=%.4f, T=%.2f, S_max=%.2f\n",
+                params->K, params->r, params->sigma, params->T, params->S_max);
+        fprintf(log_file, "每进程网格点数: %d\n", per_proc_N);
+        fprintf(log_file, "固定时间步数: %d\n", fixed_time_steps);
+        fprintf(log_file, "测试重复次数: %d\n", repeats);
+        fprintf(log_file, "--------------------------------------------------------------------------------\n");
+        fprintf(log_file, "进程数 | 全局网格点数 | 每进程网格点数 | 组装时间(s) | 求解时间(s) | 总时间(s) | 相对时间\n");
+        fprintf(log_file, "--------------------------------------------------------------------------------\n");
+    }
+    
+    // 保存原始参数
+    int original_time_steps = params->time_steps;
+    params->time_steps = fixed_time_steps;
+    
+    // 单进程基准时间
+    double base_total_time = 0.0;
+    
+    // 测试不同进程数
+    for (int i = 0; i < num_tests; i++) {
+        int num_procs = proc_list[i];
+        int global_N = per_proc_N * num_procs;
+        
+        // 创建子通信器
+        MPI_Comm sub_comm;
+        MPI_Comm_split(comm, rank < num_procs ? 0 : MPI_UNDEFINED, rank, &sub_comm);
+        
+        if (rank < num_procs) {
+            // 设置当前网格大小
+            params->N = global_N;
+            
+            double total_assembly = 0.0;
+            double total_solver = 0.0;
+            double total_total = 0.0;
+            
+            // 重复测试
+            for (int r = 0; r < repeats; r++) {
+                // 计时变量
+                double assembly_start, assembly_end;
+                double solver_start, solver_end;
+                double total_start, total_end;
+                
+                // 重置参数
+                params->current_time = 0.0;
+                
+                // 开始总计时
+                MPI_Barrier(sub_comm);
+                total_start = MPI_Wtime();
+                
+                // 模拟矩阵组装过程
+                MPI_Barrier(sub_comm);
+                assembly_start = MPI_Wtime();
+                // 实际矩阵组装代码将放在这里
+                assembly_end = MPI_Wtime();
+                
+                // 模拟求解过程
+                MPI_Barrier(sub_comm);
+                solver_start = MPI_Wtime();
+                // 实际求解器代码将放在这里
+                solver_end = MPI_Wtime();
+                
+                // 结束总计时
+                MPI_Barrier(sub_comm);
+                total_end = MPI_Wtime();
+                
+                // 累加时间
+                total_assembly += (assembly_end - assembly_start);
+                total_solver += (solver_end - solver_start);
+                total_total += (total_end - total_start);
+            }
+            
+            // 计算平均时间
+            double avg_assembly = total_assembly / repeats;
+            double avg_solver = total_solver / repeats;
+            double avg_total = total_total / repeats;
+            
+            // 收集到主进程
+            double assembly_time, solver_time, total_time;
+            MPI_Reduce(&avg_assembly, &assembly_time, 1, MPI_DOUBLE, MPI_SUM, 0, sub_comm);
+            MPI_Reduce(&avg_solver, &solver_time, 1, MPI_DOUBLE, MPI_SUM, 0, sub_comm);
+            MPI_Reduce(&avg_total, &total_time, 1, MPI_DOUBLE, MPI_SUM, 0, sub_comm);
+            
+            // 主进程记录结果
+            if (rank == 0) {
+                // 计算相对时间
+                double relative_time = (i == 0) ? 1.0 : total_time / base_total_time;
+                
+                // 保存基准时间
+                if (i == 0) {
+                    base_total_time = total_time;
+                }
+                
+                // 写入日志
+                fprintf(log_file, "%6d | %11d | %13d | %10.4f | %10.4f | %10.4f | %9.4f\n",
+                       num_procs, global_N, per_proc_N, 
+                       assembly_time, solver_time, total_time, relative_time);
+                
+                // 控制台输出
+                printf("进程数: %d, 全局网格: %d, 总时间: %.4fs, 相对时间: %.4f\n",
+                       num_procs, global_N, total_time, relative_time);
+            }
+            
+            MPI_Comm_free(&sub_comm);
+        }
+    }
+    
+    // 恢复原始参数
+    params->time_steps = original_time_steps;
+    
+    if (rank == 0) {
+        fprintf(log_file, "--------------------------------------------------------------------------------\n");
+        fprintf(log_file, "测试完成\n");
+        fclose(log_file);
+        printf("固定每进程问题规模测试结果已保存至: %s\n", log_filename);
+    }
+}
+
 // 主函数
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
@@ -929,6 +1225,8 @@ int main(int argc, char **argv) {
     int stability_test = 0; // 是否进行稳定性测试
     int test_mode = 0;    // 测试模式
     int verification_mode = 0; // 代码验证模式
+    int fixed_size_test = 0;
+    int isogranular_test = 0;
     
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
@@ -962,6 +1260,10 @@ int main(int argc, char **argv) {
             params.stability_test = 1;
         } else if (strcmp(argv[i], "-verification") == 0) {
             verification_mode = 1;
+        } else if (strcmp(argv[i], "-fixed_size_test") == 0) {
+            fixed_size_test = 1;
+        } else if (strcmp(argv[i], "-isogranular_test") == 0) {
+            isogranular_test = 1;
         }
     }
     
@@ -971,6 +1273,12 @@ int main(int argc, char **argv) {
     } else if (verification_mode) {
         // 进行代码验证
         code_verification(&params, use_implicit, MPI_COMM_WORLD);
+    } else if (fixed_size_test) {
+        // 固定问题规模并行性能测试
+        fixed_size_scalability_test(&params, use_implicit, MPI_COMM_WORLD);
+    } else if (isogranular_test) {
+        // 固定每进程问题规模并行性能测试
+        isogranular_scalability_test(&params, use_implicit, MPI_COMM_WORLD);
     } else if (test_mode) {
         // 其他测试模式...
     } else {
