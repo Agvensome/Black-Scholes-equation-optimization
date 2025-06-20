@@ -1,0 +1,16 @@
+# Fixed Problem Size Parallel Performance Test
+# Method: Explicit Euler
+# Parameters: K=100.00, r=0.0500, sigma=0.8000, T=1.00, S_max=500.00
+# Fixed space points: 10000
+# Fixed time steps: 100
+# Test repeats: 3
+# --------------------------------------------------------------
+# Procs | SpacePoints | AssemblyTime(s) | SolverTime(s) | TotalTime(s) | Speedup | Efficiency(%)
+# --------------------------------------------------------------
+1 10000 0.0000 0.0000 0.0000 1.00 100.00
+2 10000 0.0000 0.0000 0.0000 0.02 1.10
+4 10000 0.0000 0.0000 0.0001 0.01 0.15
+8 10000 0.0000 0.0000 0.0000 0.02 0.23
+16 10000 0.0000 0.0000 0.0000 0.02 0.10
+# --------------------------------------------------------------
+# Test completed

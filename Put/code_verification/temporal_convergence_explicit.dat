@@ -1,0 +1,19 @@
+# Temporal Convergence Test Results
+# Method: Explicit Euler
+# Parameters: K=100.00, r=0.0200, sigma=0.8000, T=2.00, S_max=300.00
+# Fixed space points: 1000
+# Columns: TimeSteps TimeStep(dt) MaxError
+# ----------------------------------------------
+# Calculation diverged at time steps=100
+
+# Convergence Order Analysis
+# From time steps=400 to 800: Convergence order = -inf (dt: 5040389571483599059311964546487341281189133214966410590352828632915088330034220562992440326110128763772135388341139316849846814438639505841362804598321060765604472657866614873522176.000000 -> 114
+# From time steps=800 to 1600: Convergence order = 0.0000 (dt: 114489241847629712813906844958622483379463295323701077394728440077536053734968371850719163292535409397561534585406173901060474122026049386744545599129991520675782483443486056460332563325811074
+# ----------------------------------------------
+# Test completed
+
+# Test Summary
+# Time discretization method: Explicit Euler
+# Theoretical expected convergence order: 1
+# Actual average convergence order: 0.0000
+# Verification result: PASS

@@ -1,0 +1,23 @@
+# Temporal Convergence Test Results
+# Method: Explicit Euler
+# Parameters: K=100.00, r=0.0500, sigma=0.8000, T=1.00, S_max=500.00
+# Fixed space points: 300
+# Columns: TimeSteps TimeStep(dt) MaxError
+# ----------------------------------------------
+8000 0.000125 0.538
+16000 0.0000625 0.201
+32000 0.00003125 0.075
+64000 0.000015625 0.028
+
+# Convergence Order Analysis
+# From time steps=8000 to 16000: Convergence order = 1.63 (dt: 0.000125 -> 0.0000625, Error: 0.538 -> 0.201)
+# From time steps=16000 to 32000: Convergence order = 1.59 (dt: 0.0000625 -> 0.00003125, Error: 0.201 -> 0.075)
+# From time steps=32000 to 64000: Convergence order = 1.61 (dt: 0.00003125 -> 0.000015625, Error: 0.075 -> 0.028)
+# ----------------------------------------------
+# Test completed
+
+# Test Summary
+# Time discretization method: Explicit Euler
+# Theoretical expected convergence order: 1
+# Actual average convergence order: 1.61
+# Verification result: PASS

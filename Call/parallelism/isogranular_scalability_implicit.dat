@@ -1,0 +1,16 @@
+# Fixed Per-Processor Problem Size Parallel Performance Test
+# Method: Implicit Euler
+# Parameters: K=100.00, r=0.0500, sigma=0.8000, T=1.00, S_max=500.00
+# Per-processor space points: 1000
+# Fixed time steps: 100
+# Test repeats: 3
+# --------------------------------------------------------------------------------
+# Procs | GlobalSpace | PerProcSpace | AssemblyTime(s) | SolverTime(s) | TotalTime(s) | RelativeTime
+# --------------------------------------------------------------------------------
+1 1000 1000 0.0000 0.0000 0.0000 1.0000
+2 2000 1000 0.0000 0.0000 0.0000 33.2564
+4 4000 1000 0.0000 0.0000 0.0001 109.3591
+8 8000 1000 0.0000 0.0000 0.0000 39.7550
+16 16000 1000 0.0000 0.0000 0.0000 39.6148
+# --------------------------------------------------------------------------------
+# Test completed

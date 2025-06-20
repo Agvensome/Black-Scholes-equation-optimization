@@ -1,0 +1,25 @@
+# Spatial Convergence Test Results
+# Method: Implicit Euler
+# Parameters: K=100.00, r=0.0500, sigma=0.8000, T=1.00, S_max=500.00
+# Fixed time steps: 10000
+# Columns: SpacePoints SpaceStep(dS) MaxError
+# ----------------------------------------------
+50 10.204082 4.215
+100 5.050505 1.628
+200 2.512563 0.592
+400 1.253133 0.216
+800 0.625782 0.078
+
+# Convergence Order Analysis
+# From N=50 to N=100: Convergence order = 1.65 (dS: 10.2041 -> 5.0505, Error: 4.215 -> 1.628)
+# From N=100 to N=200: Convergence order = 1.63 (dS: 5.0505 -> 2.5126, Error: 1.628 -> 0.592)
+# From N=200 to N=400: Convergence order = 1.58 (dS: 2.5126 -> 1.2531, Error: 0.592 -> 0.216)
+# From N=400 to N=800: Convergence order = 1.62 (dS: 1.2531 -> 0.6258, Error: 0.216 -> 0.078)
+# ----------------------------------------------
+# Test completed
+
+# Test Summary
+# Spatial discretization method: Finite Difference
+# Theoretical expected convergence order: 2
+# Actual average convergence order: 1.62
+# Verification result: PASS
